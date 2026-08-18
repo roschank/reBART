@@ -1,0 +1,24 @@
+reBART - third-party notices
+=============================
+
+reBART is licensed under the MIT License (see LICENSE). It re-implements
+techniques and interoperates with the projects below. No source code from the
+MIT projects was copied, only documented facts (register numbers), a shared
+NVRAM variable for interop, and reverse-engineered hardware behavior were used.
+
+- PCI Express Base Specification
+    The Resizable BAR capability register numbers used in the driver are facts
+    defined by this specification.
+
+- xCuri0/ReBarUEFI  (MIT)   https://github.com/xCuri0/ReBarUEFI
+    reBART uses the same "ReBarState" NVRAM variable name and GUID so that the
+    ReBarState.exe tool from this project can control it. No code copied.
+    (Note: ReBarUEFI's own pciRegs.h is GPL-2.0/Linux and is NOT used or
+    included here; reBART defines its own constants from the PCIe spec.)
+
+- terminatorul/NvStrapsReBar  (MIT)   https://github.com/terminatorul/NvStrapsReBar
+    The Turing BAR-size strap method (BAR0 MMIO strap window, commit bit) was
+    re-implemented from this project's reverse-engineering. No code copied.
+
+- EDK2 / TianoCore  (BSD-2-Clause-Patent)   https://github.com/tianocore/edk2
+    reBART is built as an EDK2 DXE driver and uses EDK2 headers and libraries.

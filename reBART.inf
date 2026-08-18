@@ -1,0 +1,35 @@
+## @file
+#  reBART Resizable BAR DXE driver
+#
+#  SPDX-License-Identifier: MIT
+#  Copyright (c) 2026 roschank
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = reBART
+  FILE_GUID                      = 6B2F0A14-9C3E-4D52-B1A7-2E8C5F9D3A6A
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = rebart_entry
+
+[Sources]
+  reBART.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiRuntimeServicesTableLib
+  DxeServicesTableLib
+  IoLib
+  BaseLib
+  DebugLib
+
+[Protocols]
+  gEfiS3SaveStateProtocolGuid
+
+[Depex]
+  gEfiVariableArchProtocolGuid AND gEfiVariableWriteArchProtocolGuid AND gEfiRealTimeClockArchProtocolGuid

@@ -1,0 +1,10 @@
+# build output
+Build/
+*.efi
+*.ffs
+*.dll
+*.obj
+*.lib
+*.map
+*.depex
+*.pdb
