@@ -76,6 +76,11 @@ static UINT64    g_turing_bar0 = 0;
 static UINT32    g_turing_s0 = 0, g_turing_s1 = 0;
 static BOOLEAN   g_turing_strapped = FALSE;
 
+// bridges down to the gpu
+#define MAX_BRIDGES 8
+static UINT32    g_path[MAX_BRIDGES];
+static UINT32    g_path_n = 0;
+
 // config space through ECAM and plain MMIO
 #define CFG32(off)  (*(volatile UINT32 *)(UINTN)(g_ecam + (UINT64)(off)))
 #define CFG16(off)  (*(volatile UINT16 *)(UINTN)(g_ecam + (UINT64)(off)))
@@ -121,36 +126,50 @@ static BOOLEAN resolve_ecam(void)
     return TRUE;
 }
 
-// grab the first display class card bus 0 root port
-static BOOLEAN find_discrete_gpu(UINT32 *gpu_out, UINT32 *bridge_out)
+// find the card and record its bridges
+static BOOLEAN find_discrete_gpu(UINT32 *gpu_out)
 {
-    UINT32 dev, fn, nfn, bridge, sec, gpu;
+    UINT32 bus, dev, fn, nfn, bdf, gpu = 0, gpu_bus = 0, sc, sb, next;
 
-    for (dev = 0; dev < 32; dev++) {
-        if (CFG32(BDF(0, dev, 0)) == 0xFFFFFFFF) continue;
+    g_path_n = 0;
 
-        nfn = (CFG32(BDF(0, dev, 0) + 0x0C) >> 16) & 0x80 ? 8 : 1;
-
-        for (fn = 0; fn < nfn; fn++) {
-            bridge = BDF(0, dev, fn);
-
-            if (CFG32(bridge) == 0xFFFFFFFF) continue;
-            if (((CFG32(bridge + 0x0C) >> 16) & 0x7F) != 1) continue; // not a bridge
-
-            sec = (CFG32(bridge + 0x18) >> 8) & 0xFF; // secondary bus
-            if (!sec) continue;
-
-            gpu = BDF(sec, 0, 0);
-
-            if (CFG32(gpu) == 0xFFFFFFFF) continue;
-            if (((CFG32(gpu + 0x08) >> 24) & 0xFF) != 0x03) continue;  // class 0x03 = display
-
-            *gpu_out = gpu;
-            *bridge_out = bridge;
-            return TRUE;
+    for (bus = 1; bus <= 0xFF && !gpu_bus; bus++) { // skip the igpu on bus 0
+        for (dev = 0; dev < 32; dev++) {
+            if (CFG32(BDF(bus, dev, 0)) == 0xFFFFFFFF) continue;
+            nfn = (CFG32(BDF(bus, dev, 0) + 0x0C) >> 16) & 0x80 ? 8 : 1;
+            for (fn = 0; fn < nfn; fn++) {
+                bdf = BDF(bus, dev, fn);
+                if (CFG32(bdf) == 0xFFFFFFFF) continue;
+                if (((CFG32(bdf + 0x08) >> 24) & 0xFF) == 0x03) { gpu = bdf; gpu_bus = bus; break; }
+            }
+            if (gpu_bus) break;
         }
     }
-    return FALSE;
+    if (!gpu_bus) return FALSE;
+
+    // record each bridge
+    bus = 0;
+    while (bus != gpu_bus && g_path_n < MAX_BRIDGES) {
+        next = 0xFFFF;
+        for (dev = 0; dev < 32; dev++) {
+            if (CFG32(BDF(bus, dev, 0)) == 0xFFFFFFFF) continue;
+            nfn = (CFG32(BDF(bus, dev, 0) + 0x0C) >> 16) & 0x80 ? 8 : 1;
+            for (fn = 0; fn < nfn; fn++) {
+                bdf = BDF(bus, dev, fn);
+                if (CFG32(bdf) == 0xFFFFFFFF) continue;
+                if (((CFG32(bdf + 0x0C) >> 16) & 0x7F) != 1) continue; // not a bridge
+                sc = (CFG32(bdf + 0x18) >> 8) & 0xFF; // secondary bus
+                sb = (CFG32(bdf + 0x18) >> 16) & 0xFF;	// subordinate bus
+                if (gpu_bus >= sc && gpu_bus <= sb) { g_path[g_path_n++] = bdf; next = sc; break; }
+            }
+            if (next != 0xFFFF) break;
+        }
+        if (next == 0xFFFF) return FALSE;
+        bus = next;
+    }
+
+    *gpu_out = gpu;
+    return TRUE;
 }
 
 static UINT32 find_rebar_cap(UINT32 bdf)
@@ -256,15 +275,13 @@ static void resolve_ceil(void)
     if (max_ext >= 0x80000008) {
         AsmCpuid(0x80000008, &pa, NULL, NULL, NULL);
         pa &= 0xFF;
-        if (pa < 36) pa = 36;
-        if (pa > 39) pa = 39;
         g_ceil = 1ULL << pa;
     }
 }
 
 static void do_resize(void)
 {
-    UINT32 gpu, bridge, cap, vbar = 0, b;
+    UINT32 gpu, cap, vbar = 0, b;
     UINT64 touud, top, cur, win_lo;
     UINT16 cmd;
 
@@ -272,7 +289,7 @@ static void do_resize(void)
 
     resolve_ceil(); // ceil from CPUID MAXPHYADDR
 
-    if (!find_discrete_gpu(&gpu, &bridge)) return; // no discrete gpu nothing to do
+    if (!find_discrete_gpu(&gpu)) return; // no discrete gpu
 
     touud = CFG64(HOST_BDF + TOUUD_REG) & 0x7FFFFFFFFFULL;
     cap = find_rebar_cap(gpu);
@@ -386,15 +403,21 @@ static void do_resize(void)
         b += is_64 ? 2 : 1;
     }
 
-    // open the PEG bridge prefetch window from win_lo up to 64GB-1
-    CFG16(bridge + 0x24) = ((win_lo >> 16) & 0xFFF0) | 1;
-    CFG16(bridge + 0x26) = (((CEIL - 1) >> 16) & 0xFFF0) | 1;
-    CFG32(bridge + 0x28) = win_lo >> 32;
-    CFG32(bridge + 0x2C) = (CEIL - 1) >> 32;
+    // open the prefetch window on every bridge from root down to the gpu
+    {
+        UINT32 bi, br;
+        for (bi = 0; bi < g_path_n; bi++) {
+            br = g_path[bi];
+            CFG16(br + 0x24) = (UINT16)(((win_lo >> 16) & 0xFFF0) | 1);
+            CFG16(br + 0x26) = (UINT16)((((CEIL - 1) >> 16) & 0xFFF0) | 1);
+            CFG32(br + 0x28) = (UINT32)(win_lo >> 32);
+            CFG32(br + 0x2C) = (UINT32)((CEIL - 1) >> 32);
+            CFG16(br + PCI_CMD) = CFG16(br + PCI_CMD) | CMD_MEM;
+        }
+    }
 
-    // decode back on and make sure the bridge forwards memory
+    // decode back on for the gpu
     CFG16(gpu + PCI_CMD) = cmd | CMD_MEM;
-    CFG16(bridge + PCI_CMD) = CFG16(bridge + PCI_CMD) | CMD_MEM;
 }
 
 static void EFIAPI on_ready_to_boot(EFI_EVENT evt, void *ctx)
@@ -406,7 +429,7 @@ static void EFIAPI on_ready_to_boot(EFI_EVENT evt, void *ctx)
     g_ran_already = TRUE;
 
     // no GOP CSM/legacy boot nothing to do
-    if (EFI_ERROR(gBS->LocateProtocol(&g_gop_guid, NULL, (void **)&gop)) || !gop || !gop->Mode) {
+    if (EFI_ERROR(gBS->LocateProtocol(&g_gop_guid, NULL, (void **)&gop)) || !gop->Mode) {
         gBS->CloseEvent(evt);
         return;
     }
@@ -428,7 +451,7 @@ static void EFIAPI on_ready_to_boot(EFI_EVENT evt, void *ctx)
 
     if (g_turing_strapped) {
         EFI_S3_SAVE_STATE_PROTOCOL *s3 = NULL;
-        if (!EFI_ERROR(gBS->LocateProtocol(&gEfiS3SaveStateProtocolGuid, NULL, (void **)&s3)) && s3) {
+        if (!EFI_ERROR(gBS->LocateProtocol(&gEfiS3SaveStateProtocolGuid, NULL, (void **)&s3))) {
             s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP0), (UINTN)1, &g_turing_s0);
             s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP1), (UINTN)1, &g_turing_s1);
         }
