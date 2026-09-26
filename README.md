@@ -26,8 +26,10 @@ and moves the GOP framebuffer to the new address so the OS boots with the BAR in
 Needs
 - [UEFITool](https://github.com/LongSoft/UEFITool/releases/tag/0.28.0) UEFITool 0.28.0
 - [AmiBoardInfoTool](https://github.com/xCuri0/AmiBoardInfoTool/releases) for DSDT
-- **rebart_dsdt_patch.exe**
+- [rebart_dsdt_patch.exe](https://github.com/roschank/reBART/releases/download/0.1/rebart_dsdt_patch.exe) reBART DSDT patch
 - **reBART.ffs** driver
+
+Before moving forward, ensure other ReBar UEFI modules (ReBarUEFI/NvStrapsReBar) are not present in the BIOS file.
 
 ### 1) Patch the DSDT
 

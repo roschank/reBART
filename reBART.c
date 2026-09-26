@@ -81,6 +81,9 @@ static BOOLEAN   g_turing_strapped = FALSE;
 static UINT32    g_path[MAX_BRIDGES];
 static UINT32    g_path_n = 0;
 
+// running ceiling so each gpu stacks below the previous one
+static UINT64    g_top = 0;
+
 // config space through ECAM and plain MMIO
 #define CFG32(off)  (*(volatile UINT32 *)(UINTN)(g_ecam + (UINT64)(off)))
 #define CFG16(off)  (*(volatile UINT16 *)(UINTN)(g_ecam + (UINT64)(off)))
@@ -126,14 +129,14 @@ static BOOLEAN resolve_ecam(void)
     return TRUE;
 }
 
-// find the card and record its bridges
-static BOOLEAN find_discrete_gpu(UINT32 *gpu_out)
+// find the next card at or after start_bus and record its bridges
+static BOOLEAN find_discrete_gpu(UINT32 *gpu_out, UINT32 *gpu_bus_out, UINT32 start_bus)
 {
     UINT32 bus, dev, fn, nfn, bdf, gpu = 0, gpu_bus = 0, sc, sb, next;
 
     g_path_n = 0;
 
-    for (bus = 1; bus <= 0xFF && !gpu_bus; bus++) { // skip the igpu on bus 0
+    for (bus = start_bus; bus <= 0xFF && !gpu_bus; bus++) { // skip the igpu on bus 0
         for (dev = 0; dev < 32; dev++) {
             if (CFG32(BDF(bus, dev, 0)) == 0xFFFFFFFF) continue;
             nfn = (CFG32(BDF(bus, dev, 0) + 0x0C) >> 16) & 0x80 ? 8 : 1;
@@ -169,6 +172,7 @@ static BOOLEAN find_discrete_gpu(UINT32 *gpu_out)
     }
 
     *gpu_out = gpu;
+    *gpu_bus_out = gpu_bus;
     return TRUE;
 }
 
@@ -242,7 +246,7 @@ static BOOLEAN bump_turing_straps(UINT32 gpu, UINT64 touud)
     CFG32(gpu + 0x14) = sav_lo;
     CFG32(gpu + 0x18) = sav_hi;
 
-    if (size <= 0x10000000ULL || size >= CEIL || CEIL - size < touud) {
+    if (size <= 0x10000000ULL || size >= g_top || g_top - size < touud) {
         CFG16(gpu + PCI_CMD) = cmd | CMD_MEM;
         MM32(bar0 + STRAPS_OFF + STRAP0) = s0;
         MM32(bar0 + STRAPS_OFF + STRAP1) = s1;
@@ -279,17 +283,14 @@ static void resolve_ceil(void)
     }
 }
 
-static void do_resize(void)
+static void do_resize(UINT32 gpu)
 {
-    UINT32 gpu, cap, vbar = 0, b;
+    UINT32 cap, vbar = 0, b;
     UINT64 touud, top, cur, win_lo;
     UINT16 cmd;
 
-    if (!resolve_ecam()) return;
-
-    resolve_ceil(); // ceil from CPUID MAXPHYADDR
-
-    if (!find_discrete_gpu(&gpu)) return; // no discrete gpu
+    g_got_n = 0;                // reset per gpu
+    g_turing_strapped = FALSE;
 
     touud = CFG64(HOST_BDF + TOUUD_REG) & 0x7FFFFFFFFFULL;
     cap = find_rebar_cap(gpu);
@@ -335,7 +336,7 @@ static void do_resize(void)
 
         while (n > 0) {  // top anchored has to clear TOUUD
             UINT64 szb = 1ULL << (n + 20);
-            if (szb < CEIL && CEIL - szb >= touud) break;
+            if (szb < g_top && g_top - szb >= touud) break;
             n--;
         }
 
@@ -344,7 +345,7 @@ static void do_resize(void)
         if (!n) return;
 
         g_got_n = n;
-        top = CEIL - (1ULL << (n + 20));
+        top = g_top - (1ULL << (n + 20));
 
         cmd = CFG16(gpu + PCI_CMD);
         CFG16(gpu + PCI_CMD) = cmd & ~CMD_MEM;
@@ -358,7 +359,7 @@ static void do_resize(void)
 
         //low nibble of a 64 bit pref bar is 0xC mask it off
         g_old_vbar = ((UINT64)CFG32(gpu + vbar + 4) << 32) | (CFG32(gpu + vbar) & 0xFFFFFFF0);
-        top = CEIL - (1ULL << (g_got_n + 20));
+        top = g_top - (1ULL << (g_got_n + 20));
         cmd = CFG16(gpu + PCI_CMD);
         CFG16(gpu + PCI_CMD) = cmd & ~CMD_MEM;
     }
@@ -409,21 +410,24 @@ static void do_resize(void)
         for (bi = 0; bi < g_path_n; bi++) {
             br = g_path[bi];
             CFG16(br + 0x24) = (UINT16)(((win_lo >> 16) & 0xFFF0) | 1);
-            CFG16(br + 0x26) = (UINT16)((((CEIL - 1) >> 16) & 0xFFF0) | 1);
+            CFG16(br + 0x26) = (UINT16)((((g_top - 1) >> 16) & 0xFFF0) | 1);
             CFG32(br + 0x28) = (UINT32)(win_lo >> 32);
-            CFG32(br + 0x2C) = (UINT32)((CEIL - 1) >> 32);
+            CFG32(br + 0x2C) = (UINT32)((g_top - 1) >> 32);
             CFG16(br + PCI_CMD) = CFG16(br + PCI_CMD) | CMD_MEM;
         }
     }
 
     // decode back on for the gpu
     CFG16(gpu + PCI_CMD) = cmd | CMD_MEM;
+
+    g_top = win_lo; // next gpu stacks below this one
 }
 
 static void EFIAPI on_ready_to_boot(EFI_EVENT evt, void *ctx)
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     UINT64 old_fb;
+    UINT32 gpu, gpu_bus, start = 1;
 
     if (g_ran_already) return;
     g_ran_already = TRUE;
@@ -435,25 +439,31 @@ static void EFIAPI on_ready_to_boot(EFI_EVENT evt, void *ctx)
     }
     old_fb = gop->Mode->FrameBufferBase;
 
-    do_resize();
+    if (!resolve_ecam()) { gBS->CloseEvent(evt); return; }
+    resolve_ceil(); // ceil from CPUID MAXPHYADDR
+    g_top = CEIL;   // stack gpus down from the ceiling
 
-    if (g_got_n && g_new_vbar) {
-        UINT64 wb_size = 1ULL << (g_got_n + 20);
-        gDS->AddMemorySpace(EfiGcdMemoryTypeMemoryMappedIo, g_new_vbar, wb_size, EFI_MEMORY_WC | EFI_MEMORY_UC);
-        gDS->SetMemorySpaceAttributes(g_new_vbar, wb_size, EFI_MEMORY_WC);
-    }
+    // resize every discrete gpu, each stacked below the last
+    while (find_discrete_gpu(&gpu, &gpu_bus, start)) {
+        start = gpu_bus + 1;
+        do_resize(gpu);
 
-    if (g_got_n && old_fb >= g_old_vbar && old_fb - g_old_vbar < 0x100000000ULL) gop->Mode->FrameBufferBase = g_new_vbar + (old_fb - g_old_vbar);
+        if (g_got_n && g_new_vbar) {
+            UINT64 wb_size = 1ULL << (g_got_n + 20);
+            gDS->AddMemorySpace(EfiGcdMemoryTypeMemoryMappedIo, g_new_vbar, wb_size, EFI_MEMORY_WC | EFI_MEMORY_UC);
+            gDS->SetMemorySpaceAttributes(g_new_vbar, wb_size, EFI_MEMORY_WC);
+        }
 
-    // write back the size we ended up with if it changed
-    if (g_got_n && g_got_n != g_want_orig)
-        gRT->SetVariable(g_rebar_var_name, &g_rebar_guid, EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS, sizeof(g_got_n), &g_got_n);
+        // repoint the framebuffer only for the gpu that owns the console
+        if (g_got_n && old_fb >= g_old_vbar && old_fb - g_old_vbar < 0x100000000ULL)
+            gop->Mode->FrameBufferBase = g_new_vbar + (old_fb - g_old_vbar);
 
-    if (g_turing_strapped) {
-        EFI_S3_SAVE_STATE_PROTOCOL *s3 = NULL;
-        if (!EFI_ERROR(gBS->LocateProtocol(&gEfiS3SaveStateProtocolGuid, NULL, (void **)&s3))) {
-            s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP0), (UINTN)1, &g_turing_s0);
-            s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP1), (UINTN)1, &g_turing_s1);
+        if (g_turing_strapped) {
+            EFI_S3_SAVE_STATE_PROTOCOL *s3 = NULL;
+            if (!EFI_ERROR(gBS->LocateProtocol(&gEfiS3SaveStateProtocolGuid, NULL, (void **)&s3))) {
+                s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP0), (UINTN)1, &g_turing_s0);
+                s3->Write(s3, EFI_BOOT_SCRIPT_MEM_WRITE_OPCODE, EfiBootScriptWidthUint32, (UINT64)(g_turing_bar0 + STRAPS_OFF + STRAP1), (UINTN)1, &g_turing_s1);
+            }
         }
     }
 
